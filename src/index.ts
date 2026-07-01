@@ -51,6 +51,42 @@ export namespace Signal {
     }
   }
 
+  // --- Cooling: restore unwatched-computed GC-ability in the polyfill layer ---
+  // alien's push core keeps a strong forward edge from a source to every computed
+  // that read it, so a never-watched computed that is then dropped leaks (the
+  // source pins it). The proposal guarantees such computeds are GC-able. Adapted
+  // from d681ca2 "handling cooling/warming outside the system" (stackblitz/
+  // alien-signals#43): park a standalone-read computed, and on the next microtask
+  // detach its dep edges so it — and any unwatched sub-chain it roots, via the
+  // `unwatched` cascade — can be collected. This lives off the hot propagate path,
+  // so it does not regress propagation; warming happens automatically on next read.
+  const nursery: _Computed[] = [];
+  let coolingScheduled = false;
+
+  function scheduleCooling(computed: _Computed): void {
+    nursery.push(computed);
+    if (!coolingScheduled) {
+      coolingScheduled = true;
+      queueMicrotask(cool);
+    }
+  }
+
+  function cool(): void {
+    coolingScheduled = false;
+    const batch = nursery.splice(0);
+    for (const computed of batch) {
+      // Only cool if still standalone — it may have been watched, or gained a
+      // subscriber, between being parked and now.
+      if (computed.watchCount === 0 && computed.subs === undefined) {
+        let toRemove = computed.deps;
+        while (toRemove !== undefined) {
+          toRemove = unlink(toRemove, computed);
+        }
+        computed.flags |= ReactiveFlags.Dirty; // cold -> recompute (warm) on next read
+      }
+    }
+  }
+
   class _State<T = any> implements ReactiveNode, State<T> {
     subs: Link | undefined = undefined;
     subsTail: Link | undefined = undefined;
@@ -220,6 +256,13 @@ export namespace Signal {
             this.onWatched();
           }
         }
+      } else if (this.watchCount === 0 && this.subs === undefined) {
+        // Standalone read of an unwatched computed (no active subscriber): park it
+        // so the next microtask detaches its forward edges to sources (cooling),
+        // letting it be GC'd — restoring the proposal's unwatched-computed GC
+        // guarantee that alien's push core drops by design (#79). Cooling is
+        // async; the computed warms up (recomputes + relinks) on its next read.
+        scheduleCooling(this);
       }
       if (this.isError) {
         throw this.value;
